@@ -3,7 +3,7 @@
 Simple test to process records concurrently with atomic "SELECT ... LIMIT 1 FOR UPDATE"
 
 1. Install a local SingleStore DB with https://hub.docker.com/r/memsql/cluster-in-a-box
-2. Add your DNS to the dsn variable
+2. Add your DSN to the dsn variable
 3. Launch the test with: go run main.go
 
 ## Errors
