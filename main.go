@@ -70,9 +70,9 @@ func main() {
 	singleStore.SetMaxOpenConns(500)
 	singleStore.SetMaxIdleConns(100)
 
-	// limit execution to 15secs
+	// limit execution to 10secs
 	bgCtx := context.Background()
-	ctx, _ := context.WithDeadline(bgCtx, time.Now().Add(15*time.Second))
+	ctx, _ := context.WithDeadline(bgCtx, time.Now().Add(10*time.Second))
 
 	// PREPARE TEST DB
 
@@ -152,40 +152,67 @@ func main() {
 				return
 			}
 
-			// start transaction
-			tx, err := conn.BeginTx(ctx, nil)
+			// infinite retry loop
 
-			if err != nil {
-				log.Printf("begin sql transaction error: %v", err)
-				return
-			}
-			defer tx.Rollback()
+			for {
 
-			// get an atomic id
-			var id string
+				// get an id
+				var id string
 
-			row := tx.QueryRowContext(ctx, "SELECT id FROM test LIMIT 1 FOR UPDATE")
+				row := conn.QueryRowContext(ctx, "SELECT id FROM test LIMIT 1")
 
-			if err := row.Scan(&id); err != nil {
-				if err == sql.ErrNoRows {
-					log.Println("no more rows")
+				if err := row.Scan(&id); err != nil {
+					if err == sql.ErrNoRows {
+						log.Println("no more rows")
+						return
+					}
+
+					log.Printf("scan id error: %v", err)
 					return
 				}
 
-				log.Printf("scan id error: %v", err)
-				return
-			}
+				// start transaction
+				tx, err := conn.BeginTx(ctx, nil)
 
-			time.Sleep(1 * time.Second)
+				if err != nil {
+					log.Printf("begin sql transaction error: %v", err)
+					return
+				}
+				defer tx.Rollback()
 
-			if _, err := tx.ExecContext(ctx, "DELETE FROM test WHERE id = ?", id); err != nil {
-				log.Printf("delete row error: %v", err)
-				return
-			}
+				// trying to lock the id
+				var sameId string
 
-			if err := tx.Commit(); err != nil {
-				log.Printf("commit sql transaction error: %v", err)
-				return
+				row = tx.QueryRowContext(ctx, "SELECT id FROM test WHERE id = ? FOR UPDATE", id)
+
+				if err := row.Scan(&sameId); err != nil {
+					if err == sql.ErrNoRows {
+						log.Println("can't lock the row, retrying...")
+
+						// retry loop with continue
+						continue
+					}
+
+					log.Printf("scan sameId error: %v", err)
+					return
+				}
+
+				// simulating work...
+				time.Sleep(1 * time.Second)
+
+				// deleting the row
+				if _, err := tx.ExecContext(ctx, "DELETE FROM test WHERE id = ?", id); err != nil {
+					log.Printf("delete row error: %v", err)
+					return
+				}
+
+				if err := tx.Commit(); err != nil {
+					log.Printf("commit sql transaction error: %v", err)
+					return
+				}
+
+				// stop the retry loop if the commit passed
+				break
 			}
 
 			return
@@ -193,5 +220,16 @@ func main() {
 	}
 
 	wg.Wait()
-	log.Println("finished, exiting")
+
+	// count the processed rows
+	var count int
+
+	row := conn.QueryRowContext(bgCtx, "SELECT COUNT(id) FROM test")
+
+	if err := row.Scan(&count); err != nil {
+		log.Printf("scan count error: %v", err)
+		return
+	}
+
+	log.Printf("%v rows processed, exiting", 1000-count)
 }
