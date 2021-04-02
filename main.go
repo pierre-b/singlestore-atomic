@@ -71,8 +71,13 @@ func main() {
 	singleStore.SetMaxIdleConns(100)
 
 	// limit execution to 10secs
+
+	secs := 10
+	multiplier := time.Duration(secs)
+	duration := time.Second
+
 	bgCtx := context.Background()
-	ctx, _ := context.WithDeadline(bgCtx, time.Now().Add(10*time.Second))
+	ctx, _ := context.WithDeadline(bgCtx, time.Now().Add(multiplier*duration))
 
 	// PREPARE TEST DB
 
@@ -116,7 +121,9 @@ func main() {
 	log.Println("inserting rows...")
 
 	values := []string{}
-	for y := 0; y < 1000; y++ {
+	totalRows := 1000
+
+	for y := 0; y < totalRows; y++ {
 		values = append(values, fmt.Sprintf("(%v)", y))
 	}
 	if _, err = conn.ExecContext(ctx, fmt.Sprintf(`INSERT INTO test values %v;`, strings.Join(values, ","))); err != nil {
@@ -153,6 +160,7 @@ func main() {
 			}
 
 			// infinite retry loop
+			retryCount := 0
 
 			for {
 
@@ -187,8 +195,8 @@ func main() {
 
 				if err := row.Scan(&sameId); err != nil {
 					if err == sql.ErrNoRows {
-						log.Println("can't lock the row, retrying...")
-
+						// log.Println("can't lock the row, retrying...")
+						retryCount++
 						// retry loop with continue
 						continue
 					}
@@ -196,6 +204,8 @@ func main() {
 					log.Printf("scan sameId error: %v", err)
 					return
 				}
+
+				log.Printf("got a row after %v retries", retryCount)
 
 				// simulating work...
 				time.Sleep(1 * time.Second)
@@ -231,5 +241,5 @@ func main() {
 		return
 	}
 
-	log.Printf("%v rows processed, exiting", 1000-count)
+	log.Printf("%v rows processed in %vsecs, exiting", totalRows-count, secs)
 }
