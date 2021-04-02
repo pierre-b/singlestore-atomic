@@ -196,6 +196,9 @@ func main() {
 				if err := row.Scan(&sameId); err != nil {
 					if err == sql.ErrNoRows {
 						// log.Println("can't lock the row, retrying...")
+						if err := tx.Rollback(); err != nil {
+							log.Printf("rollback err: %v", err)
+						}
 						retryCount++
 						// retry loop with continue
 						continue
