@@ -9,14 +9,16 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 func main() {
+	// add line numbers to log messages
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	// INIT SQL CONNECTION
 
-	dsn := "root:root@tcp(127.0.0.1:3333)/?interpolateParams=true&parseTime=true"
+	dsn := "root:@tcp(127.0.0.1:3306)/?interpolateParams=true&parseTime=true"
 
 	// uncomment to add custom certs
 
@@ -109,8 +111,26 @@ func main() {
 
 	if _, err = conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS test (
 		id VARCHAR(60) NOT NULL,
+		finished BOOL DEFAULT FALSE NOT NULL,
+		created TIMESTAMP DEFAULT NOW() NOT NULL,
 		PRIMARY KEY (id),
 		SHARD KEY (id)
+	  );`); err != nil {
+		log.Fatalf("create test table error: %v", err)
+		return
+	}
+
+	if _, err = conn.ExecContext(ctx, `DROP TABLE IF EXISTS executions;`); err != nil {
+		log.Fatalf("drop test table error: %v", err)
+	}
+
+	if _, err = conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS executions (
+		id int AUTO_INCREMENT NOT NULL,
+		task_id VARCHAR(60) NOT NULL,
+		attempt int NOT NULL,
+		PRIMARY KEY (id, task_id),
+		SHARD KEY (task_id),
+		UNIQUE KEY (task_id, attempt)
 	  );`); err != nil {
 		log.Fatalf("create test table error: %v", err)
 		return
@@ -126,7 +146,7 @@ func main() {
 	for y := 0; y < totalRows; y++ {
 		values = append(values, fmt.Sprintf("(%v)", y))
 	}
-	if _, err = conn.ExecContext(ctx, fmt.Sprintf(`INSERT INTO test values %v;`, strings.Join(values, ","))); err != nil {
+	if _, err = conn.ExecContext(ctx, fmt.Sprintf(`INSERT INTO test (id) values %v;`, strings.Join(values, ","))); err != nil {
 		log.Fatalf("insert test table error: %v", err)
 		return
 	}
@@ -159,15 +179,57 @@ func main() {
 				return
 			}
 
-			// infinite retry loop
+			// the eventual dequeued test id
+			var id string
+
+			// infinite retry to dequeue a task
 			retryCount := 0
-
 			for {
+				result, err := conn.ExecContext(ctx, `
+					INSERT INTO executions (task_id, attempt)
+					SELECT test.id, IFNULL(MAX(attempt) + 1, 1)
+					FROM test
+					LEFT JOIN executions ON test.id = executions.task_id
+					WHERE test.finished = FALSE
+					GROUP BY test.id
+					HAVING MAX(executions.task_id) IS NULL
+					ORDER BY RAND() ASC
+					LIMIT 1
+				`)
+				if err != nil {
+					mysqlErr, ok := err.(*mysql.MySQLError)
+					if !ok {
+						log.Printf("dequeue error: %v", err)
+						return
+					}
 
-				// get an id
-				var id string
+					// 1062 = ER_DUP_ENTRY
+					// 1213 = ER_LOCK_DEADLOCK
+					if mysqlErr.Number == 1062 || mysqlErr.Number == 1213 {
+						// dequeue collision with another worker
+						retryCount++
+						continue
+					}
 
-				row := conn.QueryRowContext(ctx, "SELECT id FROM test LIMIT 1")
+					log.Printf("dequeue error: %v", err)
+					return
+				}
+
+				// XXX: HANDLE no row dequeued
+				executionID, err := result.LastInsertId()
+				if err != nil {
+					log.Printf("LastInsertId error: %v", err)
+					return
+				}
+
+				// we have succesfully dequeued a test row
+				// now we need to retrieve it's id
+				row := conn.QueryRowContext(ctx, `
+					SELECT test.id
+					FROM executions
+					INNER JOIN test ON test.id = executions.task_id
+					WHERE executions.id = ?
+				`, executionID)
 
 				if err := row.Scan(&id); err != nil {
 					if err == sql.ErrNoRows {
@@ -179,53 +241,18 @@ func main() {
 					return
 				}
 
-				// start transaction
-				tx, err := conn.BeginTx(ctx, nil)
-
-				if err != nil {
-					log.Printf("begin sql transaction error: %v", err)
-					return
-				}
-				defer tx.Rollback()
-
-				// trying to lock the id
-				var sameId string
-
-				row = tx.QueryRowContext(ctx, "SELECT id FROM test WHERE id = ? FOR UPDATE", id)
-
-				if err := row.Scan(&sameId); err != nil {
-					if err == sql.ErrNoRows {
-						// log.Println("can't lock the row, retrying...")
-						if err := tx.Rollback(); err != nil {
-							log.Printf("rollback err: %v", err)
-						}
-						retryCount++
-						// retry loop with continue
-						continue
-					}
-
-					log.Printf("scan sameId error: %v", err)
-					return
-				}
-
-				log.Printf("got a row after %v retries", retryCount)
-
-				// simulating work...
-				time.Sleep(1 * time.Second)
-
-				// deleting the row
-				if _, err := tx.ExecContext(ctx, "DELETE FROM test WHERE id = ?", id); err != nil {
-					log.Printf("delete row error: %v", err)
-					return
-				}
-
-				if err := tx.Commit(); err != nil {
-					log.Printf("commit sql transaction error: %v", err)
-					return
-				}
-
-				// stop the retry loop if the commit passed
 				break
+			}
+
+			log.Printf("got a row with id %s after %d attempts", id, retryCount)
+
+			// simulating work...
+			time.Sleep(1 * time.Second)
+
+			// marking the row as completed
+			if _, err := conn.ExecContext(ctx, "UPDATE test SET finished = TRUE WHERE id = ?", id); err != nil {
+				log.Printf("update row error: %v", err)
+				return
 			}
 
 			return
@@ -237,12 +264,12 @@ func main() {
 	// count the processed rows
 	var count int
 
-	row := conn.QueryRowContext(bgCtx, "SELECT COUNT(id) FROM test")
+	row := conn.QueryRowContext(bgCtx, "SELECT COUNT(id) FROM test where finished = TRUE")
 
 	if err := row.Scan(&count); err != nil {
 		log.Printf("scan count error: %v", err)
 		return
 	}
 
-	log.Printf("%v rows processed in %vsecs, exiting", totalRows-count, secs)
+	log.Printf("%v rows processed in %vsecs, exiting", count, secs)
 }
