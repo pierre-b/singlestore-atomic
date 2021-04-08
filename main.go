@@ -9,6 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"sync/atomic"
+
+	"github.com/eapache/go-resiliency/semaphore"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -18,7 +21,7 @@ func main() {
 
 	// INIT SQL CONNECTION
 
-	dsn := "root:@tcp(127.0.0.1:3306)/?interpolateParams=true&parseTime=true"
+	dsn := "root:root@tcp(127.0.0.1:3333)/?interpolateParams=true&parseTime=true"
 
 	// uncomment to add custom certs
 
@@ -136,12 +139,12 @@ func main() {
 		return
 	}
 
-	// INSERT 1000 ROWS FOR TESTING
+	// INSERT ROWS FOR TESTING
 
 	log.Println("inserting rows...")
 
 	values := []string{}
-	totalRows := 1000
+	totalRows := 100000
 
 	for y := 0; y < totalRows; y++ {
 		values = append(values, fmt.Sprintf("(%v)", y))
@@ -153,16 +156,37 @@ func main() {
 
 	log.Println("done inserting rows")
 
-	// LAUNCH 100 CONCURRENT WORKERS
+	// max tickets in parallel
+	concurrency := 200
+	sem := semaphore.New(concurrency, 6*time.Second)
 
+	var maxTimeTaken time.Duration
 	var wg sync.WaitGroup
 
-	for i := 0; i < 100; i++ {
+	workStart := time.Now()
+	shouldContinue := true
+	var duplicatesCount uint64
+
+	for shouldContinue == true {
+
+		if err := sem.Acquire(); err != nil {
+			continue
+		}
+
+		// tickets can wait in the Acquire() before the shouldContinue changed to false
+		// check if we can still continue
+		if shouldContinue == false {
+			log.Println("abort, shouldContinue == false")
+			continue
+		}
 
 		wg.Add(1)
 
 		go func() {
 			defer wg.Done()
+			defer sem.Release()
+
+			startTimer := time.Now()
 
 			// opens a new connection to the DB
 			conn, err := singleStore.Conn(ctx)
@@ -206,6 +230,7 @@ func main() {
 					// 1062 = ER_DUP_ENTRY
 					// 1213 = ER_LOCK_DEADLOCK
 					if mysqlErr.Number == 1062 || mysqlErr.Number == 1213 {
+						atomic.AddUint64(&duplicatesCount, 1)
 						// dequeue collision with another worker
 						retryCount++
 						continue
@@ -233,6 +258,7 @@ func main() {
 
 				if err := row.Scan(&id); err != nil {
 					if err == sql.ErrNoRows {
+						shouldContinue = false
 						log.Println("no more rows")
 						return
 					}
@@ -255,14 +281,24 @@ func main() {
 				return
 			}
 
+			timeTaken := time.Now().Sub(startTimer)
+			if timeTaken > maxTimeTaken {
+				maxTimeTaken = timeTaken
+			}
+
 			return
 		}()
+
+		// still has enough time?
+		if deadline, _ := ctx.Deadline(); deadline.Sub(time.Now()) < maxTimeTaken+3 {
+			shouldContinue = false
+		}
 	}
 
 	wg.Wait()
 
 	// count the processed rows
-	var count int
+	var count uint64
 
 	row := conn.QueryRowContext(bgCtx, "SELECT COUNT(id) FROM test where finished = TRUE")
 
@@ -271,5 +307,9 @@ func main() {
 		return
 	}
 
-	log.Printf("%v rows processed in %vsecs, exiting", count, secs)
+	endedAt := time.Now().Sub(workStart)
+
+	retryRate := (duplicatesCount * 100) / count
+
+	log.Printf("%v rows processed in %v, %v%% retried, concurrency: %v, exiting", count, endedAt, retryRate, concurrency)
 }
