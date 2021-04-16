@@ -11,6 +11,8 @@ import (
 
 	"sync/atomic"
 
+	"math/rand"
+
 	"github.com/eapache/go-resiliency/semaphore"
 	"github.com/go-sql-driver/mysql"
 )
@@ -75,14 +77,16 @@ func main() {
 	singleStore.SetMaxOpenConns(500)
 	singleStore.SetMaxIdleConns(100)
 
-	// limit execution to 10secs
+	// limit execution to 20secs
 
-	secs := 10
+	secs := 20
 	multiplier := time.Duration(secs)
 	duration := time.Second
 
 	bgCtx := context.Background()
-	ctx, _ := context.WithDeadline(bgCtx, time.Now().Add(multiplier*duration))
+	ctx, cancel := context.WithDeadline(bgCtx, time.Now().Add(multiplier*duration))
+
+	defer cancel()
 
 	// PREPARE TEST DB
 
@@ -217,7 +221,6 @@ func main() {
 					WHERE test.finished = FALSE
 					GROUP BY test.id
 					HAVING MAX(executions.task_id) IS NULL
-					ORDER BY RAND() ASC
 					LIMIT 1
 				`)
 				if err != nil {
@@ -272,8 +275,15 @@ func main() {
 
 			log.Printf("got a row with id %s after %d attempts", id, retryCount)
 
-			// simulating work...
-			time.Sleep(1 * time.Second)
+			// simulating work, between 1s to 1.2s
+			rand.Seed(time.Now().UnixNano())
+			min := 1000
+			max := 1200
+			ms := rand.Intn(max-min+1) + min
+			msMultiplier := time.Duration(ms)
+			msDuration := time.Millisecond
+
+			time.Sleep(msMultiplier * msDuration)
 
 			// marking the row as completed
 			if _, err := conn.ExecContext(ctx, "UPDATE test SET finished = TRUE WHERE id = ?", id); err != nil {
